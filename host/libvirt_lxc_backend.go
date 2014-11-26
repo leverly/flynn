@@ -837,7 +837,7 @@ func (l *LibvirtLXCBackend) Cleanup() error {
 			g.Log(grohl.Data{"at": "stop", "job.id": id})
 			err := l.Stop(id)
 			if err != nil {
-				g.Log(grohl.Data{"at": "error", "job.id": id, "err": err})
+				g.Log(grohl.Data{"at": "error", "job.id": id, "err": err.Error()})
 			}
 			errs <- err
 		}(id)
