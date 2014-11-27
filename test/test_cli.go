@@ -5,36 +5,48 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/ioutil"
+	"os/exec"
 	"strings"
-	"time"
 
 	c "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
 	"github.com/flynn/flynn/Godeps/_workspace/src/golang.org/x/crypto/ssh"
-	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/controller/client"
 	"github.com/flynn/flynn/pkg/random"
 )
 
 type CliSuite struct {
 	Helper
-	app     *ct.App
-	release *ct.Release
 }
 
-var _ = c.Suite(&CliSuite{})
-
-func (s *CliSuite) SetUpSuite(t *c.C) {
-	s.app, s.release = s.createApp(t)
-}
+var _ = c.ConcurrentSuite(&CliSuite{})
 
 func (s *CliSuite) TearDownSuite(t *c.C) {
 	s.cleanup()
 }
 
 func (s *CliSuite) flynn(t *c.C, args ...string) *CmdResult {
-	if args[0] != "-a" {
-		args = append([]string{"-a", s.app.Name}, args...)
-	}
 	return flynn(t, "/", args...)
+}
+
+func (s *CliSuite) newCliTestApp(t *c.C) *cliTestApp {
+	app, _ := s.createApp(t)
+	stream, err := s.controllerClient(t).StreamJobEvents(app.Name, 0)
+	t.Assert(err, c.IsNil)
+	return &cliTestApp{app.Name, stream, t}
+}
+
+type cliTestApp struct {
+	name   string
+	stream *controller.JobEventStream
+	t      *c.C
+}
+
+func (a *cliTestApp) flynn(args ...string) *CmdResult {
+	return flynn(a.t, "/", append([]string{"-a", a.name}, args...)...)
+}
+
+func (a *cliTestApp) waitFor(events jobEvents) (int64, string) {
+	return waitForJobEvents(a.t, a.stream.Events, events)
 }
 
 func (s *CliSuite) TestApp(t *c.C) {
@@ -79,20 +91,17 @@ func (s *CliSuite) TestKey(t *c.C) {
 }
 
 func (s *CliSuite) TestPs(t *c.C) {
-	stream, err := s.controllerClient(t).StreamJobEvents(s.app.Name, 0)
-	if err != nil {
-		t.Error(err)
-	}
+	app := s.newCliTestApp(t)
 	ps := func() []string {
-		out := s.flynn(t, "ps")
+		out := app.flynn("ps")
 		t.Assert(out, Succeeds)
 		ary := strings.Split(out.Output, "\n")
 		return ary[1 : len(ary)-1]
 	}
 	// empty formation == empty ps
 	t.Assert(ps(), c.HasLen, 0)
-	t.Assert(s.flynn(t, "scale", "echoer=3"), Succeeds)
-	waitForJobEvents(t, stream.Events, jobEvents{"echoer": {"up": 3}})
+	t.Assert(app.flynn("scale", "echoer=3"), Succeeds)
+	app.waitFor(jobEvents{"echoer": {"up": 3}})
 	jobs := ps()
 	// should return 3 jobs
 	t.Assert(jobs, c.HasLen, 3)
@@ -100,82 +109,67 @@ func (s *CliSuite) TestPs(t *c.C) {
 	for _, j := range jobs {
 		t.Assert(j, Matches, "echoer")
 	}
-	t.Assert(s.flynn(t, "scale", "echoer=0"), Succeeds)
-	waitForJobEvents(t, stream.Events, jobEvents{"echoer": {"down": 3}})
+	t.Assert(app.flynn("scale", "echoer=0"), Succeeds)
+	app.waitFor(jobEvents{"echoer": {"down": 3}})
 	t.Assert(ps(), c.HasLen, 0)
 }
 
 func (s *CliSuite) TestScale(t *c.C) {
-	stream, err := s.controllerClient(t).StreamJobEvents(s.app.Name, 0)
-	if err != nil {
-		t.Error(err)
-	}
-	t.Assert(s.flynn(t, "scale", "echoer=1"), Succeeds)
-	waitForJobEvents(t, stream.Events, jobEvents{"echoer": {"up": 1}})
+	app := s.newCliTestApp(t)
+	t.Assert(app.flynn("scale", "echoer=1"), Succeeds)
+	app.waitFor(jobEvents{"echoer": {"up": 1}})
 	// should only start the missing two jobs
-	t.Assert(s.flynn(t, "scale", "echoer=3"), Succeeds)
-	waitForJobEvents(t, stream.Events, jobEvents{"echoer": {"up": 2}})
+	t.Assert(app.flynn("scale", "echoer=3"), Succeeds)
+	app.waitFor(jobEvents{"echoer": {"up": 2}})
 	// should stop all jobs
-	t.Assert(s.flynn(t, "scale", "echoer=0"), Succeeds)
-	waitForJobEvents(t, stream.Events, jobEvents{"echoer": {"down": 3}})
+	t.Assert(app.flynn("scale", "echoer=0"), Succeeds)
+	app.waitFor(jobEvents{"echoer": {"down": 3}})
 }
 
 func (s *CliSuite) TestEnv(t *c.C) {
-	t.Assert(s.flynn(t, "env", "set", "ENV_TEST=var", "SECOND_VAL=2"), Succeeds)
-	t.Assert(s.flynn(t, "env"), OutputContains, "ENV_TEST=var\nSECOND_VAL=2")
-	t.Assert(s.flynn(t, "env", "get", "ENV_TEST"), Outputs, "var\n")
+	app := s.newCliTestApp(t)
+	t.Assert(app.flynn("env", "set", "ENV_TEST=var", "SECOND_VAL=2"), Succeeds)
+	t.Assert(app.flynn("env"), OutputContains, "ENV_TEST=var\nSECOND_VAL=2")
+	t.Assert(app.flynn("env", "get", "ENV_TEST"), Outputs, "var\n")
 	// test that containers do contain the ENV var
-	t.Assert(s.flynn(t, "run", "-e", "bash", "--", "-c", "echo $ENV_TEST"), Outputs, "var\n")
-	t.Assert(s.flynn(t, "env", "unset", "ENV_TEST"), Succeeds)
-	t.Assert(s.flynn(t, "run", "-e", "bash", "--", "-c", "echo $ENV_TEST"), Outputs, "\n")
+	t.Assert(app.flynn("run", "-e", "bash", "--", "-c", "echo $ENV_TEST"), Outputs, "var\n")
+	t.Assert(app.flynn("env", "unset", "ENV_TEST"), Succeeds)
+	t.Assert(app.flynn("run", "-e", "bash", "--", "-c", "echo $ENV_TEST"), Outputs, "\n")
 }
 
 func (s *CliSuite) TestKill(t *c.C) {
-	stream, err := s.controllerClient(t).StreamJobEvents(s.app.Name, 0)
-	if err != nil {
-		t.Error(err)
-	}
-	t.Assert(s.flynn(t, "scale", "echoer=1"), Succeeds)
+	app := s.newCliTestApp(t)
+	t.Assert(app.flynn("scale", "echoer=1"), Succeeds)
+	_, jobID := app.waitFor(jobEvents{"echoer": {"up": 1}})
 
-	_, jobID := waitForJobEvents(t, stream.Events, jobEvents{"echoer": {"up": 1}})
-	t.Assert(s.flynn(t, "kill", jobID), Succeeds)
-	// detect the job being killed
-outer:
-	for {
-		select {
-		case e := <-stream.Events:
-			if strings.Contains(jobID, e.JobID) && e.State == "down" {
-				break outer
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("timed out waiting for job kill event")
-		}
-	}
-	t.Assert(s.flynn(t, "scale", "echoer=0"), Succeeds)
-	waitForJobEvents(t, stream.Events, jobEvents{"echoer": {"down": 1}})
+	t.Assert(app.flynn("kill", jobID), Succeeds)
+	_, stoppedID := app.waitFor(jobEvents{"echoer": {"down": 1}})
+	t.Assert(stoppedID, c.Equals, jobID)
 }
 
 func (s *CliSuite) TestRoute(t *c.C) {
+	app := s.newCliTestApp(t)
+
 	// flynn route add http
 	route := random.String(32) + ".dev"
-	newRoute := s.flynn(t, "route", "add", "http", route)
+	newRoute := app.flynn("route", "add", "http", route)
 	t.Assert(newRoute, Succeeds)
 	routeID := strings.TrimSpace(newRoute.Output)
-	t.Assert(s.flynn(t, "route"), OutputContains, routeID)
+	t.Assert(app.flynn("route"), OutputContains, routeID)
 
 	// flynn route remove
-	t.Assert(s.flynn(t, "route", "remove", routeID), Succeeds)
-	t.Assert(s.flynn(t, "route"), c.Not(OutputContains), routeID)
+	t.Assert(app.flynn("route", "remove", routeID), Succeeds)
+	t.Assert(app.flynn("route"), c.Not(OutputContains), routeID)
 
 	// flynn route add tcp
-	tcpRoute := s.flynn(t, "route", "add", "tcp")
+	tcpRoute := app.flynn("route", "add", "tcp")
 	t.Assert(tcpRoute, Succeeds)
 	routeID = strings.Split(tcpRoute.Output, " ")[0]
-	t.Assert(s.flynn(t, "route"), OutputContains, routeID)
+	t.Assert(app.flynn("route"), OutputContains, routeID)
 
 	// flynn route remove
-	t.Assert(s.flynn(t, "route", "remove", routeID), Succeeds)
-	t.Assert(s.flynn(t, "route"), c.Not(OutputContains), routeID)
+	t.Assert(app.flynn("route", "remove", routeID), Succeeds)
+	t.Assert(app.flynn("route"), c.Not(OutputContains), routeID)
 }
 
 func (s *CliSuite) TestProvider(t *c.C) {
@@ -183,34 +177,42 @@ func (s *CliSuite) TestProvider(t *c.C) {
 }
 
 func (s *CliSuite) TestResource(t *c.C) {
-	t.Assert(s.flynn(t, "resource", "add", "postgres").Output, Matches, `Created resource \w+ and release \w+.`)
-	res, err := s.controllerClient(t).AppResourceList(s.app.Name)
+	app := s.newCliTestApp(t)
+	t.Assert(app.flynn("resource", "add", "postgres").Output, Matches, `Created resource \w+ and release \w+.`)
+
+	res, err := s.controllerClient(t).AppResourceList(app.name)
 	t.Assert(err, c.IsNil)
 	t.Assert(res, c.HasLen, 1)
 }
 
 func (s *CliSuite) TestLog(t *c.C) {
-	stream, err := s.controllerClient(t).StreamJobEvents(s.app.Name, 0)
-	if err != nil {
-		t.Error(err)
-	}
-	t.Assert(s.flynn(t, "scale", "printer=1"), Succeeds)
-	_, jobID := waitForJobEvents(t, stream.Events, jobEvents{"printer": {"up": 1}})
+	app := s.newCliTestApp(t)
+	t.Assert(app.flynn("scale", "printer=1"), Succeeds)
+	_, jobID := app.waitFor(jobEvents{"printer": {"up": 1}})
 
-	t.Assert(s.flynn(t, "log", jobID), OutputContains, "I like to print")
+	t.Assert(app.flynn("log", jobID), OutputContains, "I like to print")
 
-	t.Assert(s.flynn(t, "scale", "printer=0"), Succeeds)
-	waitForJobEvents(t, stream.Events, jobEvents{"printer": {"down": 1}})
+	t.Assert(app.flynn("scale", "printer=0"), Succeeds)
+	app.waitFor(jobEvents{"printer": {"down": 1}})
 }
 
 func (s *CliSuite) TestCluster(t *c.C) {
+	// use a custom flynnrc to avoid disrupting other tests
+	file, err := ioutil.TempFile("", "")
+	t.Assert(err, c.IsNil)
+	flynn := func(cmdArgs ...string) *CmdResult {
+		cmd := exec.Command(args.CLI, cmdArgs...)
+		cmd.Env = flynnEnv(file.Name())
+		return run(t, cmd)
+	}
+
 	// cluster add
-	t.Assert(s.flynn(t, "cluster", "add", "-g", "test.example.com:2222", "-p", "KGCENkp53YF5OvOKkZIry71+czFRkSw2ZdMszZ/0ljs=", "test", "https://controller.test.example.com", "e09dc5301d72be755a3d666f617c4600"), Succeeds)
-	t.Assert(s.flynn(t, "cluster"), OutputContains, "test")
+	t.Assert(flynn("cluster", "add", "-g", "test.example.com:2222", "-p", "KGCENkp53YF5OvOKkZIry71+czFRkSw2ZdMszZ/0ljs=", "test", "https://controller.test.example.com", "e09dc5301d72be755a3d666f617c4600"), Succeeds)
+	t.Assert(flynn("cluster"), OutputContains, "test")
 	// overwriting should not work
-	t.Assert(s.flynn(t, "cluster", "add", "test", "foo", "bar"), c.Not(Succeeds))
-	t.Assert(s.flynn(t, "cluster"), OutputContains, "test")
+	t.Assert(flynn("cluster", "add", "test", "foo", "bar"), c.Not(Succeeds))
+	t.Assert(flynn("cluster"), OutputContains, "test")
 	// cluster remove
-	t.Assert(s.flynn(t, "cluster", "remove", "test"), Succeeds)
-	t.Assert(s.flynn(t, "cluster"), c.Not(OutputContains), "test")
+	t.Assert(flynn("cluster", "remove", "test"), Succeeds)
+	t.Assert(flynn("cluster"), c.Not(OutputContains), "test")
 }

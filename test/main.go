@@ -211,9 +211,21 @@ type CmdResult struct {
 	Err    error
 }
 
+func flynnEnv(path string) []string {
+	env := os.Environ()
+	res := make([]string, 0, len(env)+1)
+	for _, v := range env {
+		if !strings.HasPrefix(v, "FLYNNRC=") {
+			res = append(res, v)
+		}
+	}
+	res = append(res, "FLYNNRC="+path)
+	return res
+}
+
 func flynn(t *check.C, dir string, cmdArgs ...string) *CmdResult {
 	cmd := exec.Command(args.CLI, cmdArgs...)
-	cmd.Env = append(os.Environ(), "FLYNNRC="+flynnrc)
+	cmd.Env = flynnEnv(flynnrc)
 	cmd.Dir = dir
 	return run(t, cmd)
 }
